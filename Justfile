@@ -64,6 +64,40 @@ build-docker-linux-armv7:
         -t {{image}}:latest-armv7 \
         .
 
+# Build all docker image variants, push them, create multi-arch manifests (:tag and :latest), and push
+docker-release:
+    #!/usr/bin/env sh
+    set -e
+    IMAGE={{image}}
+    TAG={{tag}}
+    if [ "{{container_tool}}" = "podman" ]; then
+        podman build --platform=linux/amd64  -f Dockerfile -t "${IMAGE}:${TAG}-amd64"  -t "${IMAGE}:latest-amd64"  .
+        podman build --platform=linux/arm64  -f Dockerfile -t "${IMAGE}:${TAG}-arm64"  -t "${IMAGE}:latest-arm64"  .
+        podman build --platform=linux/arm/v7 -f Dockerfile -t "${IMAGE}:${TAG}-armv7"  -t "${IMAGE}:latest-armv7"  .
+        for ARCH in amd64 arm64 armv7; do
+            podman push "${IMAGE}:${TAG}-${ARCH}"
+            podman push "${IMAGE}:latest-${ARCH}"
+        done
+
+        podman manifest rm  "${IMAGE}:${TAG}" 2>/dev/null || true
+        podman manifest create "${IMAGE}:${TAG}"
+        podman manifest add    "${IMAGE}:${TAG}" "${IMAGE}:${TAG}-amd64"
+        podman manifest add    "${IMAGE}:${TAG}" "${IMAGE}:${TAG}-arm64"
+        podman manifest add    "${IMAGE}:${TAG}" "${IMAGE}:${TAG}-armv7"
+        podman manifest push --all "${IMAGE}:${TAG}"
+    else
+        for ARCH_SPEC in "linux/amd64:amd64" "linux/arm64:arm64" "linux/arm/v7:armv7"; do
+            PLATFORM="${ARCH_SPEC%%:*}"
+            SUFFIX="${ARCH_SPEC##*:}"
+            docker buildx build --platform="${PLATFORM}" -f Dockerfile \
+                -t "${IMAGE}:${TAG}-${SUFFIX}" -t "${IMAGE}:latest-${SUFFIX}" --push .
+        done
+        docker buildx imagetools create -t "${IMAGE}:${TAG}" \
+            "${IMAGE}:${TAG}-amd64" "${IMAGE}:${TAG}-arm64" "${IMAGE}:${TAG}-armv7"
+        docker buildx imagetools create -t "${IMAGE}:latest" \
+            "${IMAGE}:latest-amd64" "${IMAGE}:latest-arm64" "${IMAGE}:latest-armv7"
+    fi
+
 # Install tools used by go generate
 _install_controller_gen:
     go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
