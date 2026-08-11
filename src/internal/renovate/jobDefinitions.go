@@ -59,6 +59,15 @@ func newDiscoveryJob(job *api.RenovateJob, traceparent string) *batchv1.Job {
 			},
 		})
 	}
+	if job.Spec.GithubEnterpriseAppReference != nil {
+		envFromSecrets = append(envFromSecrets, v1.EnvFromSource{
+			SecretRef: &v1.SecretEnvSource{
+				LocalObjectReference: v1.LocalObjectReference{
+					Name: github.GetNameForGithubAppHostRulesSecret(job),
+				},
+			},
+		})
+	}
 
 	volumes, volumeMounts := getVolumeAndMounts(job)
 
@@ -140,6 +149,15 @@ func newRenovateJob(job *api.RenovateJob, project string, traceparent string) *b
 			SecretRef: &v1.SecretEnvSource{
 				LocalObjectReference: v1.LocalObjectReference{
 					Name: github.GetNameForGithubAppSecret(job),
+				},
+			},
+		})
+	}
+	if job.Spec.GithubEnterpriseAppReference != nil {
+		envFromSecrets = append(envFromSecrets, v1.EnvFromSource{
+			SecretRef: &v1.SecretEnvSource{
+				LocalObjectReference: v1.LocalObjectReference{
+					Name: github.GetNameForGithubAppHostRulesSecret(job),
 				},
 			},
 		})

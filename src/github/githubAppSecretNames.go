@@ -19,6 +19,12 @@ func GetNameForGithubAppInstallationSecret(job *api.RenovateJob, installationID 
 	return githubAppSecretName(job.Name, installationID)
 }
 
+// GetNameForGithubAppHostRulesSecret names the Secret holding the RENOVATE_HOST_RULES
+// covering every organization a GitHub Enterprise App installation has access to.
+func GetNameForGithubAppHostRulesSecret(job *api.RenovateJob) string {
+	return githubAppSecretName(job.Name, "host-rules")
+}
+
 // githubAppSecretName builds a Kubernetes-safe secret name of the form
 // {name}-github-app-{suffix}-{sha256[:4]} (or without -{suffix} when empty).
 // Total length is guaranteed ≤ 63 characters.

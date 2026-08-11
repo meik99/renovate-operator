@@ -98,26 +98,30 @@ func NewGitHubAppTokenCreatorWithLogger(client client.Client, logger logr.Logger
 	}
 }
 
-// isTokenFresh returns true if the secret exists and its token has >30 min remaining.
-// Returns (false, nil) when missing or expiring. Returns (false, err) on unexpected k8s errors.
-func (g *githubappToken) isTokenFresh(ctx context.Context, namespace, secretName string) (bool, error) {
+// existingToken returns the RENOVATE_TOKEN value held by secretName and whether it still has
+// more than 30 minutes remaining before expiry. Returns fresh=false (with an empty token) when
+// the secret is missing or has no valid expiry annotation. Returns an error only for unexpected
+// k8s API failures.
+func (g *githubappToken) existingToken(ctx context.Context, namespace, secretName string) (token string, fresh bool, err error) {
 	existing := &corev1.Secret{}
-	err := g.client.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, existing)
-	if err != nil {
+	if err = g.client.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, existing); err != nil {
 		if k8serrors.IsNotFound(err) {
-			return false, nil
+			return "", false, nil
 		}
-		return false, fmt.Errorf("failed to get token secret %s: %w", secretName, err)
+		return "", false, fmt.Errorf("failed to get token secret %s: %w", secretName, err)
 	}
 	expiresAtStr, ok := existing.Annotations[tokenExpiresAtAnnotation]
 	if !ok {
-		return false, nil
+		return "", false, nil
 	}
-	expiresAt, err := time.Parse(time.RFC3339, expiresAtStr)
-	if err != nil {
-		return false, nil
+	expiresAt, parseErr := time.Parse(time.RFC3339, expiresAtStr)
+	if parseErr != nil {
+		return "", false, nil
 	}
-	return time.Until(expiresAt) > 30*time.Minute, nil
+	if time.Until(expiresAt) <= 30*time.Minute {
+		return "", false, nil
+	}
+	return string(existing.Data["RENOVATE_TOKEN"]), true, nil
 }
 
 // readBaseCredentials fetches the Kubernetes Secret referenced by creds and returns the
@@ -163,7 +167,7 @@ func (g *githubappToken) EnsureToken(ctx context.Context, job *api.RenovateJob) 
 	}
 
 	secretName := GetNameForGithubAppSecret(job)
-	fresh, err := g.isTokenFresh(ctx, job.Namespace, secretName)
+	_, fresh, err := g.existingToken(ctx, job.Namespace, secretName)
 	if err != nil {
 		return err
 	}
@@ -283,7 +287,15 @@ func (g *githubappToken) createInstallationTokenWithJWT(signedJWT, installationI
 	return tr.Token, tr.ExpiresAt, nil
 }
 
-func (g *githubappToken) listInstallationIDs(appID, pemStr, githubApi string) ([]string, error) {
+// installationInfo identifies a single GitHub App installation: its numeric ID (used for
+// minting installation tokens and naming per-installation secrets) and the org/user login it
+// is installed on (used to scope a hostRule to that organization's repos).
+type installationInfo struct {
+	ID    string
+	Login string
+}
+
+func (g *githubappToken) listInstallations(appID, pemStr, githubApi string) ([]installationInfo, error) {
 	privateKey, err := parsePEMKey(pemStr)
 	if err != nil {
 		return nil, err
@@ -292,39 +304,50 @@ func (g *githubappToken) listInstallationIDs(appID, pemStr, githubApi string) ([
 	if err != nil {
 		return nil, err
 	}
-	return g.listInstallationIDsWithJWT(signedJWT, githubApi)
+	return g.listInstallationsWithJWT(signedJWT, githubApi)
 }
 
-// listInstallationIDsWithJWT lists all installations given an already-signed app JWT, so
+// listInstallationsWithJWT lists all installations given an already-signed app JWT, so
 // EnsureTokensForEnterpriseApp can reuse the same JWT it mints for the token-creation loop.
 // The endpoint is paginated; we request 100 per page and stop when a page returns fewer than 100.
-func (g *githubappToken) listInstallationIDsWithJWT(signedJWT, githubApi string) ([]string, error) {
-	var ids []string
-	for page := 1; ; page++ {
-		url := fmt.Sprintf("%s/app/installations?per_page=100&page=%d", githubApi, page)
+func (g *githubappToken) listInstallationsWithJWT(signedJWT, githubApi string) ([]installationInfo, error) {
+	var installations []installationInfo
+	for pageNum := 1; ; pageNum++ {
+		url := fmt.Sprintf("%s/app/installations?per_page=100&page=%d", githubApi, pageNum)
 		body, err := g.doGithubAppRequest("GET", url, signedJWT)
 		if err != nil {
 			return nil, err
 		}
 
-		var installations []struct {
-			ID int64 `json:"id"`
+		var page []struct {
+			ID      int64 `json:"id"`
+			Account struct {
+				Login string `json:"login"`
+			} `json:"account"`
 		}
-		if err = json.Unmarshal(body, &installations); err != nil {
+		if err = json.Unmarshal(body, &page); err != nil {
 			return nil, err
 		}
-		for _, inst := range installations {
-			ids = append(ids, strconv.FormatInt(inst.ID, 10))
+		for _, inst := range page {
+			installations = append(installations, installationInfo{
+				ID:    strconv.FormatInt(inst.ID, 10),
+				Login: inst.Account.Login,
+			})
 		}
-		if len(installations) < 100 {
+		if len(page) < 100 {
 			break
 		}
 	}
-	return ids, nil
+	return installations, nil
 }
 
 // Secret names are deterministic: GetNameForGithubAppInstallationSecret(job, id) can regenerate
 // each name from the job and installation ID alone, so the returned slice need not be persisted.
+//
+// Alongside each installation's own token secret, this also builds a shared RENOVATE_HOST_RULES
+// secret (GetNameForGithubAppHostRulesSecret) covering every organization the App is installed
+// on, scoped by matchHost to that org's repos path. This lets a Renovate run for one org's
+// project still resolve presets hosted in another org the same App has access to.
 func (g *githubappToken) EnsureTokensForEnterpriseApp(ctx context.Context, job *api.RenovateJob) ([]string, error) {
 	if job.Spec.GithubEnterpriseAppReference == nil {
 		return nil, fmt.Errorf("GithubEnterpriseAppReference is not defined")
@@ -347,32 +370,75 @@ func (g *githubappToken) EnsureTokensForEnterpriseApp(ctx context.Context, job *
 		return nil, err
 	}
 
-	installIDs, err := g.listInstallationIDsWithJWT(signedJWT, githubApi)
+	installations, err := g.listInstallationsWithJWT(signedJWT, githubApi)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list installation IDs: %w", err)
+		return nil, fmt.Errorf("failed to list installations: %w", err)
 	}
 
-	secretNames := make([]string, 0, len(installIDs))
-	for _, id := range installIDs {
-		secretName := GetNameForGithubAppInstallationSecret(job, id)
-		fresh, err := g.isTokenFresh(ctx, job.Namespace, secretName)
+	secretNames := make([]string, 0, len(installations))
+	hostRules := make([]hostRule, 0, len(installations))
+	for _, inst := range installations {
+		secretName := GetNameForGithubAppInstallationSecret(job, inst.ID)
+		token, fresh, err := g.existingToken(ctx, job.Namespace, secretName)
 		if err != nil {
 			return nil, err
 		}
-		if fresh {
-			secretNames = append(secretNames, secretName)
-			continue
-		}
-		g.logger.Info("creating/renewing enterprise github app token", "job", job.Fullname(), "installationID", id)
+		if !fresh {
+			g.logger.Info("creating/renewing enterprise github app token", "job", job.Fullname(), "installationID", inst.ID)
 
-		token, expiresAt, err := g.createInstallationTokenWithJWT(signedJWT, id, githubApi)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create token for installation %s: %w", id, err)
-		}
-		if err = g.upsertTokenSecret(ctx, job, secretName, token, expiresAt); err != nil {
-			return nil, fmt.Errorf("failed to upsert token secret %s: %w", secretName, err)
+			var expiresAt time.Time
+			token, expiresAt, err = g.createInstallationTokenWithJWT(signedJWT, inst.ID, githubApi)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create token for installation %s: %w", inst.ID, err)
+			}
+			if err = g.upsertTokenSecret(ctx, job, secretName, token, expiresAt); err != nil {
+				return nil, fmt.Errorf("failed to upsert token secret %s: %w", secretName, err)
+			}
 		}
 		secretNames = append(secretNames, secretName)
+		hostRules = append(hostRules, hostRule{
+			MatchHost: orgMatchHost(githubApi, inst.Login),
+			HostType:  "github",
+			Token:     token,
+		})
 	}
+
+	if err := g.upsertHostRulesSecret(ctx, job, hostRules); err != nil {
+		return nil, fmt.Errorf("failed to upsert host rules secret: %w", err)
+	}
+
 	return secretNames, nil
+}
+
+// orgMatchHost builds a Renovate hostRules matchHost value scoped to one organization's repos
+// on githubApi. Renovate matches hostRules by URL prefix and prefers the longest match, so
+// scoping by "<api>/repos/<org>/" lets each organization's token apply only to that
+// organization's repos even though every installation shares the same API host.
+func orgMatchHost(githubApi, login string) string {
+	return strings.TrimRight(githubApi, "/") + "/repos/" + login + "/"
+}
+
+// hostRule is a single entry of Renovate's RENOVATE_HOST_RULES JSON array.
+type hostRule struct {
+	MatchHost string `json:"matchHost"`
+	HostType  string `json:"hostType,omitempty"`
+	Token     string `json:"token"`
+}
+
+// upsertHostRulesSecret creates or updates the Secret holding RENOVATE_HOST_RULES for job,
+// owned by job so Kubernetes GC cleans it up on deletion alongside the per-installation
+// token secrets.
+func (g *githubappToken) upsertHostRulesSecret(ctx context.Context, job *api.RenovateJob, rules []hostRule) error {
+	rulesJSON, err := json.Marshal(rules)
+	if err != nil {
+		return fmt.Errorf("failed to marshal host rules: %w", err)
+	}
+	s := &corev1.Secret{}
+	s.Namespace = job.Namespace
+	s.Name = GetNameForGithubAppHostRulesSecret(job)
+	_, err = controllerutil.CreateOrUpdate(ctx, g.client, s, func() error {
+		s.Data = map[string][]byte{"RENOVATE_HOST_RULES": rulesJSON}
+		return controllerutil.SetControllerReference(job, s, g.client.Scheme())
+	})
+	return err
 }
