@@ -39,3 +39,6 @@ dist/
 
 # Helm chart dependency archives (fetched via `helm dependency build`)
 charts/renovate-operator/charts/*.tgz
+
+# macOS
+.DS_Store
