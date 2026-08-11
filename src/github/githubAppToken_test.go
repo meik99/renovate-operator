@@ -606,7 +606,7 @@ func newEnterpriseJob(secretName string) *api.RenovateJob {
 	}
 }
 
-func TestListInstallationIDs_Success(t *testing.T) {
+func TestListInstallations_Success(t *testing.T) {
 	_, pemString, err := generateTestRSAKey()
 	if err != nil {
 		t.Fatalf("failed to generate test key: %v", err)
@@ -627,7 +627,10 @@ func TestListInstallationIDs_Success(t *testing.T) {
 				if req.Header.Get("Authorization") == "" {
 					t.Errorf("missing Authorization header")
 				}
-				body, _ := json.Marshal([]map[string]any{{"id": 111}, {"id": 222}})
+				body, _ := json.Marshal([]map[string]any{
+					{"id": 111, "account": map[string]string{"login": "org-a"}},
+					{"id": 222, "account": map[string]string{"login": "org-b"}},
+				})
 				return &http.Response{
 					StatusCode: 200,
 					Body:       io.NopCloser(bytes.NewReader(body)),
@@ -640,16 +643,17 @@ func TestListInstallationIDs_Success(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()
 	g := NewGitHubAppTokenCreatorWithHTTPClient(fakeClient, mockClient)
 
-	ids, err := g.listInstallationIDs("12345", pemString, "https://api.github.com")
+	installations, err := g.listInstallations("12345", pemString, "https://api.github.com")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(ids) != 2 || ids[0] != "111" || ids[1] != "222" {
-		t.Errorf("expected [111 222], got %v", ids)
+	want := []installationInfo{{ID: "111", Login: "org-a"}, {ID: "222", Login: "org-b"}}
+	if len(installations) != len(want) || installations[0] != want[0] || installations[1] != want[1] {
+		t.Errorf("expected %v, got %v", want, installations)
 	}
 }
 
-func TestListInstallationIDs_APIError(t *testing.T) {
+func TestListInstallations_APIError(t *testing.T) {
 	_, pemString, err := generateTestRSAKey()
 	if err != nil {
 		t.Fatalf("failed to generate test key: %v", err)
@@ -670,7 +674,7 @@ func TestListInstallationIDs_APIError(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()
 	g := NewGitHubAppTokenCreatorWithHTTPClient(fakeClient, mockClient)
 
-	_, err = g.listInstallationIDs("12345", pemString, "https://api.github.com")
+	_, err = g.listInstallations("12345", pemString, "https://api.github.com")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -679,13 +683,31 @@ func TestListInstallationIDs_APIError(t *testing.T) {
 	}
 }
 
-func TestListInstallationIDs_InvalidPEM(t *testing.T) {
+func TestListInstallations_InvalidPEM(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()
 	g := NewGitHubAppTokenCreator(fakeClient)
 
-	_, err := g.listInstallationIDs("12345", "not-a-pem", "https://api.github.com")
+	_, err := g.listInstallations("12345", "not-a-pem", "https://api.github.com")
 	if err == nil {
 		t.Fatal("expected error for invalid PEM, got nil")
+	}
+}
+
+func TestOrgMatchHost(t *testing.T) {
+	tests := []struct {
+		githubApi string
+		login     string
+		want      string
+	}{
+		{"https://api.github.com", "org-a", "https://api.github.com/repos/org-a/"},
+		{"https://api.github.com/", "org-a", "https://api.github.com/repos/org-a/"},
+		{"https://ghe.company.com/api/v3", "org-b", "https://ghe.company.com/api/v3/repos/org-b/"},
+	}
+	for _, tt := range tests {
+		got := orgMatchHost(tt.githubApi, tt.login)
+		if got != tt.want {
+			t.Errorf("orgMatchHost(%q, %q) = %q, want %q", tt.githubApi, tt.login, got, tt.want)
+		}
 	}
 }
 
@@ -728,7 +750,10 @@ func TestEnsureTokensForEnterpriseApp_Success(t *testing.T) {
 			responseFunc: func(req *http.Request) (*http.Response, error) {
 				callCount++
 				if req.Method == "GET" {
-					body, _ := json.Marshal([]map[string]any{{"id": 111}, {"id": 222}})
+					body, _ := json.Marshal([]map[string]any{
+						{"id": 111, "account": map[string]string{"login": "org-a"}},
+						{"id": 222, "account": map[string]string{"login": "org-b"}},
+					})
 					return &http.Response{
 						StatusCode: 200,
 						Body:       io.NopCloser(bytes.NewReader(body)),
@@ -790,6 +815,24 @@ func TestEnsureTokensForEnterpriseApp_Success(t *testing.T) {
 			t.Errorf("secret %s missing RENOVATE_TOKEN", name)
 		}
 	}
+
+	// Verify the shared host rules secret covers both organizations, each scoped by its own
+	// org path so the two entries don't collide despite sharing api.github.com.
+	hostRulesSecret := &corev1.Secret{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Name: GetNameForGithubAppHostRulesSecret(job), Namespace: "default"}, hostRulesSecret); err != nil {
+		t.Fatalf("host rules secret not found: %v", err)
+	}
+	var rules []hostRule
+	if err := json.Unmarshal(hostRulesSecret.Data["RENOVATE_HOST_RULES"], &rules); err != nil {
+		t.Fatalf("failed to unmarshal RENOVATE_HOST_RULES: %v", err)
+	}
+	want := []hostRule{
+		{MatchHost: "https://api.github.com/repos/org-a/", HostType: "github", Token: "token-111"},
+		{MatchHost: "https://api.github.com/repos/org-b/", HostType: "github", Token: "token-222"},
+	}
+	if len(rules) != len(want) || rules[0] != want[0] || rules[1] != want[1] {
+		t.Errorf("expected host rules %+v, got %+v", want, rules)
+	}
 }
 
 func TestEnsureTokensForEnterpriseApp_SkipsFreshToken(t *testing.T) {
@@ -806,7 +849,7 @@ func TestEnsureTokensForEnterpriseApp_SkipsFreshToken(t *testing.T) {
 					postCount++
 					t.Errorf("unexpected POST to %s: fresh token should have been skipped", req.URL.Path)
 				}
-				body, _ := json.Marshal([]map[string]any{{"id": 111}})
+				body, _ := json.Marshal([]map[string]any{{"id": 111, "account": map[string]string{"login": "org-a"}}})
 				return &http.Response{
 					StatusCode: 200,
 					Body:       io.NopCloser(bytes.NewReader(body)),
@@ -851,6 +894,20 @@ func TestEnsureTokensForEnterpriseApp_SkipsFreshToken(t *testing.T) {
 	}
 	if postCount != 0 {
 		t.Errorf("expected no POST calls for fresh token, got %d", postCount)
+	}
+
+	// The host rule must still be built from the existing (skipped-refresh) token.
+	hostRulesSecret := &corev1.Secret{}
+	if err := fakeClient.Get(context.Background(), client.ObjectKey{Name: GetNameForGithubAppHostRulesSecret(job), Namespace: "default"}, hostRulesSecret); err != nil {
+		t.Fatalf("host rules secret not found: %v", err)
+	}
+	var rules []hostRule
+	if err := json.Unmarshal(hostRulesSecret.Data["RENOVATE_HOST_RULES"], &rules); err != nil {
+		t.Fatalf("failed to unmarshal RENOVATE_HOST_RULES: %v", err)
+	}
+	want := hostRule{MatchHost: "https://api.github.com/repos/org-a/", HostType: "github", Token: "existing-token"}
+	if len(rules) != 1 || rules[0] != want {
+		t.Errorf("expected host rules [%+v], got %+v", want, rules)
 	}
 }
 
